@@ -1,7 +1,8 @@
 // 학생 브라우저는 이 함수에만 요청을 보냅니다.
 // API 키, 과제 설정, 안전 검사 규칙은 모두 서버에만 있어 학생에게 노출되지 않습니다.
 
-const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
+const GEMINI_URL = (model) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
 const CFG = () => ({
   taskTitle: process.env.TASK_TITLE || "오늘의 과제",
@@ -9,8 +10,7 @@ const CFG = () => ({
   keywords: process.env.TASK_KEYWORDS || "",
   hintOnly: (process.env.ANSWER_MODE || "hint") === "hint",
   classCode: process.env.CLASS_CODE || "",
-  guardModel: process.env.GUARD_MODEL || "gpt-5.4-mini",
-  answerModel: process.env.ANSWER_MODEL || "gpt-5.4-mini",
+  model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
   logUrl: process.env.LOG_WEBHOOK_URL || "",
 });
 
@@ -21,29 +21,37 @@ const BLOCK_WORDS = ["야한", "음란", "성인물", "포르노", "마약", "�
 const MSG = {
   offtopic: "이건 이번 과제와 관련이 없는 질문 같아요. 과제에 대해 궁금한 점을 다시 물어봐 주세요.",
   unsafe: "이 질문에는 답할 수 없어요. 과제에 대한 질문으로 바꿔서 물어봐 주세요.",
-  help:
-    "지금 마음이 힘들거나 곤란한 일이 있다면 혼자 참지 말고 선생님이나 집에 계신 어른께 바로 이야기해 주세요. 전화로 이야기하고 싶다면 청소년 상담 1388로 걸 수 있어요.",
+  help: "지금 마음이 힘들거나 곤란한 일이 있다면 혼자 참지 말고 선생님이나 집에 계신 어른께 바로 이야기해 주세요. 전화로 이야기하고 싶다면 청소년 상담 1388로 걸 수 있어요.",
 };
 
-async function openai(model, messages, maxTokens) {
-  const res = await fetch(OPENAI_URL, {
+// Gemini API 호출 (system instruction + contents 형식)
+async function gemini(model, systemText, turns, maxTokens) {
+  const body = {
+    system_instruction: { parts: [{ text: systemText }] },
+    contents: turns,
+    generationConfig: { maxOutputTokens: maxTokens },
+    safetySettings: [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_LOW_AND_ABOVE" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_LOW_AND_ABOVE" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_LOW_AND_ABOVE" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_LOW_AND_ABOVE" },
+    ],
+  };
+  const res = await fetch(GEMINI_URL(model), {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({ model, messages, max_completion_tokens: maxTokens }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`OpenAI ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`Gemini ${res.status}: ${await res.text()}`);
   const data = await res.json();
-  return (data.choices?.[0]?.message?.content || "").trim();
+  return (data.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
 }
 
 async function screen(text, cfg) {
   if (HELP_WORDS.some((w) => text.includes(w))) return "help";
   if (BLOCK_WORDS.some((w) => text.includes(w))) return "unsafe";
 
-  const system = `너는 초등학교 5학년(만 11세) 학생용 학습 챗봇의 안전 검사기다.
+  const systemText = `너는 초등학교 5학년(만 11세) 학생용 학습 챗봇의 안전 검사기다.
 학생의 질문을 읽고 ok, offtopic, unsafe, help 중 한 단어만 출력한다. 다른 말은 절대 쓰지 않는다.
 
 판정 기준(위에서부터 우선 적용):
@@ -56,17 +64,13 @@ async function screen(text, cfg) {
 [과제 설명] ${cfg.taskDetail}
 [관련 키워드] ${cfg.keywords}`;
 
-  const out = await openai(cfg.guardModel, [
-    { role: "system", content: system },
-    { role: "user", content: text },
-  ], 200);
-
+  const out = await gemini(cfg.model, systemText, [{ role: "user", parts: [{ text }] }], 10);
   const m = out.toLowerCase().match(/ok|offtopic|unsafe|help/);
-  return m ? m[0] : "unsafe"; // 판독 실패 시 막는 쪽으로
+  return m ? m[0] : "unsafe";
 }
 
 async function answer(text, history, cfg) {
-  const system = `너는 초등학교 5학년 학생의 과제를 돕는 학습 도우미다.
+  const systemText = `너는 초등학교 5학년 학생의 과제를 돕는 학습 도우미다.
 
 [이번 과제] ${cfg.taskTitle}
 [과제 설명] ${cfg.taskDetail}
@@ -79,14 +83,17 @@ async function answer(text, history, cfg) {
 - 학생의 이름, 주소, 연락처 등 개인정보를 묻지 않는다.
 - 마지막 줄에 학생이 스스로 생각해 볼 질문을 하나 덧붙인다.
 ${cfg.hintOnly
-      ? "- 힌트 모드: 정답을 바로 알려 주지 말고, 단서와 되묻는 질문으로 학생이 직접 찾아내도록 이끈다."
-      : "- 설명 모드: 필요한 내용을 예시와 함께 차근차근 설명해 준다."}`;
+    ? "- 힌트 모드: 정답을 바로 알려 주지 말고, 단서와 되묻는 질문으로 학생이 직접 찾아내도록 이끈다."
+    : "- 설명 모드: 필요한 내용을 예시와 함께 차근차근 설명해 준다."}`;
 
-  return await openai(cfg.answerModel, [
-    { role: "system", content: system },
-    ...history,
-    { role: "user", content: text },
-  ], 700);
+  // history를 Gemini 형식(user/model)으로 변환
+  const turns = history.map((m) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
+  turns.push({ role: "user", parts: [{ text }] });
+
+  return await gemini(cfg.model, systemText, turns, 700);
 }
 
 async function writeLog(cfg, row) {
@@ -98,7 +105,7 @@ async function writeLog(cfg, row) {
       body: JSON.stringify(row),
     });
   } catch (e) {
-    console.error("log failed", e.message); // 기록 실패가 수업을 막지 않도록 함
+    console.error("log failed", e.message);
   }
 }
 
